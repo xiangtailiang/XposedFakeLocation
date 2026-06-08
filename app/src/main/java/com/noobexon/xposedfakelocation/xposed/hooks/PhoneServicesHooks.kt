@@ -1,7 +1,5 @@
 package com.noobexon.xposedfakelocation.xposed.hooks
 
-import android.telephony.CellInfo
-import android.telephony.NeighboringCellInfo
 import android.util.Log
 import com.noobexon.xposedfakelocation.xposed.utils.LocationUtil
 import com.noobexon.xposedfakelocation.xposed.utils.PreferencesUtil
@@ -40,27 +38,29 @@ class PhoneServicesHooks(
 
     private fun hookCellInfo(phoneInterfaceManagerClass: Class<*>) {
         hookAll(phoneInterfaceManagerClass, "getAllCellInfo") { chain ->
+            val result = chain.proceed()
             if (shouldSpoofArgs(chain.args)) {
                 // Return empty cell info on purpose so apps that rely on tower checks can fall back
                 // to GPS-derived location when spoofing is active.
                 // TODO: This may conflict with other telephony signals (for example, network type
                 // still reporting MOBILE). If users report issues, synthesize coherent fake data.
                 module.log(Log.INFO, tag, "Cleared all cell info while spoofing.")
-                emptyList<CellInfo>()
+                emptyLikeResult(result)
             } else {
-                chain.proceed()
+                result
             }
         }
 
         hookAll(phoneInterfaceManagerClass, "getNeighboringCellInfo") { chain ->
+            val result = chain.proceed()
             if (shouldSpoofArgs(chain.args)) {
                 // Same reasoning as getAllCellInfo: keep neighboring towers empty to encourage
                 // GPS fallback in apps that combine cell and GNSS signals.
                 // TODO: If consistency checks fail in some apps, provide coherent fake neighbors.
                 module.log(Log.INFO, tag, "Cleared neighboring cell info while spoofing.")
-                emptyList<NeighboringCellInfo>()
+                emptyLikeResult(result)
             } else {
-                chain.proceed()
+                result
             }
         }
 
@@ -120,6 +120,38 @@ class PhoneServicesHooks(
     private fun extractPackageName(value: Any?): String? {
         if (value is String) return value.takeIf { "." in it && !it.startsWith("android.") }
         return null
+    }
+
+    // Builds an empty result whose runtime type matches `original`, so a spoofed "no data" reply
+    // stays Binder-serializable. Returning a bare kotlin EmptyList where the framework method
+    // actually returns a ParceledListSlice makes Parcel.writeTypedObject call writeToParcel on a
+    // non-Parcelable, throwing IncompatibleClassChangeError and crashing the host system process.
+    private fun emptyLikeResult(original: Any?): Any? {
+        return when {
+            original == null -> null
+            isParceledListSlice(original) -> emptyParceledListSlice() ?: original
+            original is List<*> -> ArrayList<Any?>()
+            else -> original
+        }
+    }
+
+    private fun isParceledListSlice(value: Any): Boolean {
+        var clazz: Class<*>? = value.javaClass
+        while (clazz != null) {
+            if (clazz.name == "android.content.pm.ParceledListSlice") return true
+            clazz = clazz.superclass
+        }
+        return false
+    }
+
+    private fun emptyParceledListSlice(): Any? {
+        return runCatching {
+            val clazz = Class.forName("android.content.pm.ParceledListSlice")
+            clazz.methods.firstOrNull { it.name == "emptyList" && it.parameterTypes.isEmpty() }?.invoke(null)
+                ?: clazz.getConstructor(List::class.java).newInstance(emptyList<Any>())
+        }.onFailure {
+            module.log(Log.ERROR, tag, "Failed building empty ParceledListSlice: ${it.message}")
+        }.getOrNull()
     }
 
     private fun defaultReturnValue(method: Method?): Any? {

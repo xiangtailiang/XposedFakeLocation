@@ -5,7 +5,6 @@ import android.location.Location
 import android.location.LocationManager
 import android.net.wifi.WifiInfo
 import android.os.Build
-import android.telephony.CellInfo
 import android.util.ArrayMap
 import android.util.Log
 import com.noobexon.xposedfakelocation.xposed.utils.LocationUtil
@@ -162,7 +161,7 @@ class SystemServicesHooks(
             val result = chain.proceed()
             if (shouldSpoofArgs(chain.args)) {
                 module.log(Log.INFO, tag, "Cleared MIUI blurry cell info result.")
-                emptyList<CellInfo>()
+                emptyLikeResult(result)
             } else {
                 result
             }
@@ -269,7 +268,7 @@ class SystemServicesHooks(
             val result = chain.proceed()
             if (shouldSpoofArgs(chain.args)) {
                 module.log(Log.INFO, tag, "Cleared Wi-Fi scan results while spoofing.")
-                emptyList<Any>()
+                emptyLikeResult(result)
             } else {
                 result
             }
@@ -565,6 +564,39 @@ class SystemServicesHooks(
         } else {
             null
         }
+    }
+
+    // Builds an empty result whose runtime type matches `original`, so a spoofed "no data" reply
+    // stays Binder-serializable. Returning a bare kotlin EmptyList where the framework method
+    // actually returns a ParceledListSlice (e.g. IWifiManager.getScanResults on many ROMs) makes
+    // Parcel.writeTypedObject call writeToParcel on a non-Parcelable, throwing
+    // IncompatibleClassChangeError on the binder thread and taking down the whole system_server.
+    private fun emptyLikeResult(original: Any?): Any? {
+        return when {
+            original == null -> null
+            isParceledListSlice(original) -> emptyParceledListSlice() ?: original
+            original is List<*> -> ArrayList<Any?>()
+            else -> original
+        }
+    }
+
+    private fun isParceledListSlice(value: Any): Boolean {
+        var clazz: Class<*>? = value.javaClass
+        while (clazz != null) {
+            if (clazz.name == "android.content.pm.ParceledListSlice") return true
+            clazz = clazz.superclass
+        }
+        return false
+    }
+
+    private fun emptyParceledListSlice(): Any? {
+        return runCatching {
+            val clazz = Class.forName("android.content.pm.ParceledListSlice")
+            clazz.methods.firstOrNull { it.name == "emptyList" && it.parameterTypes.isEmpty() }?.invoke(null)
+                ?: clazz.getConstructor(List::class.java).newInstance(emptyList<Any>())
+        }.onFailure {
+            module.log(Log.ERROR, tag, "Failed building empty ParceledListSlice: ${it.message}")
+        }.getOrNull()
     }
 
     private fun defaultReturnValue(method: Method?): Any? {
